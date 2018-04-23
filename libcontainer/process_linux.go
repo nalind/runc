@@ -3,6 +3,7 @@
 package libcontainer
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall" // only for Signal
 
 	"github.com/opencontainers/runc/libcontainer/cgroups"
@@ -116,6 +118,12 @@ func (p *setnsProcess) start() (err error) {
 		case procHooks:
 			// This shouldn't happen.
 			panic("unexpected procHooks in setns")
+		case procMountRootfs:
+			// This shouldn't happen.
+			panic("unexpected procMountRootfs in setns")
+		case procFinalizeRootfs:
+			// This shouldn't happen.
+			panic("unexpected procFinalizeRootfs in setns")
 		default:
 			return newSystemError(fmt.Errorf("invalid JSON payload from child"))
 		}
@@ -263,6 +271,174 @@ func (p *initProcess) execSetns() error {
 	return nil
 }
 
+func (p *initProcess) mountRootfsTemplate(childPipe io.Reader) (*exec.Cmd, error) {
+	cmd := exec.Command(p.container.initPath, p.container.initArgs[1:]...)
+	cmd.Args[0] = p.container.initArgs[0]
+	cmd.Stdin = childPipe
+	cmd.Dir = p.config.Config.Rootfs
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.Env = append(cmd.Env, fmt.Sprintf("_LIBCONTAINER_MOUNTROOTFS_PID=%d", p.pid()))
+	// NOTE: when running a container with no PID namespace and the parent process spawning the container is
+	// PID1 the pdeathsig is being delivered to the container's init process by the kernel for some reason
+	// even with the parent still running.
+	if p.config.Config.ParentDeathSignal > 0 {
+		cmd.SysProcAttr.Pdeathsig = syscall.Signal(p.config.Config.ParentDeathSignal)
+	}
+	return cmd, nil
+}
+
+// If mount options specify a UID or GID, map them from the container IDs to
+// host IDs.  Add the parameter for filesystems that can take one or the other,
+// and which are being left to have the default value (0).
+func undoIDMappings(config *configs.Config) error {
+	for m := range config.Mounts {
+		hasUid := false
+		hasGid := false
+		options := strings.Split(config.Mounts[m].Data, ",")
+		if config.Mounts[m].Data == "" {
+			options = []string{}
+		}
+		for o := range options {
+			if strings.HasPrefix(options[o], "uid=") {
+				uid, err := strconv.Atoi(options[o][4:])
+				if err != nil {
+					return fmt.Errorf("error parsing %q: %v", options[o][4:], err)
+				}
+				if uid, err := config.HostUID(uid); err == nil {
+					options[o] = fmt.Sprintf("uid=%d", uid)
+				} else {
+					return fmt.Errorf("error mapping container UID %d to host UID: %v", uid, err)
+				}
+				hasUid = true
+			}
+			if strings.HasPrefix(options[o], "gid=") {
+				gid, err := strconv.Atoi(options[o][4:])
+				if err != nil {
+					return fmt.Errorf("error parsing %q: %v", options[o][4:], err)
+				}
+				if gid, err := config.HostGID(gid); err == nil {
+					options[o] = fmt.Sprintf("gid=%d", gid)
+				} else {
+					return fmt.Errorf("error mapping container GID %d to host GID: %v", gid, err)
+				}
+				hasGid = true
+			}
+		}
+		switch config.Mounts[m].Device {
+		case "devpts", "mqueue", "proc", "sysfs", "tmpfs":
+			if !hasUid {
+				if uid, err := config.HostUID(0); err == nil {
+					options = append(options, fmt.Sprintf("uid=%d", uid))
+				} else {
+					return fmt.Errorf("error mapping container UID 0 to host UID: %v", err)
+				}
+			}
+			if !hasGid {
+				if gid, err := config.HostGID(0); err == nil {
+					options = append(options, fmt.Sprintf("gid=%d", gid))
+				} else {
+					return fmt.Errorf("error mapping container GID 0 to host GID: %v", err)
+				}
+			}
+		}
+		config.Mounts[m].Data = strings.Join(options, ",")
+	}
+	return nil
+}
+
+func init() {
+	var config initConfig
+	nsPid := os.Getenv("_LIBCONTAINER_MOUNTROOTFS_PID")
+	if nsPid == "" {
+		return
+	}
+	if err := json.NewDecoder(os.Stdin).Decode(&config); err != nil {
+		fmt.Fprintf(os.Stderr, "jsondecode(stdin): %v", err)
+		os.Exit(1)
+	}
+	if err := undoIDMappings(config.Config); err != nil {
+		fmt.Fprintf(os.Stderr, "mountRootfs(): %v", err)
+		os.Exit(1)
+	}
+	if err := mountRootfs(&config, parentMountTypes, nil, true); err != nil {
+		fmt.Fprintf(os.Stderr, "mountRootfs(): %v", err)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func (p *initProcess) pivotRootfsTemplate(childPipe io.Reader) (*exec.Cmd, error) {
+	cmd := exec.Command(p.container.initPath, p.container.initArgs[1:]...)
+	cmd.Args[0] = p.container.initArgs[0]
+	cmd.Stdin = childPipe
+	cmd.Dir = p.config.Config.Rootfs
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.Env = append(cmd.Env, fmt.Sprintf("_LIBCONTAINER_PIVOTROOTFS_PID=%d", p.pid()))
+	// NOTE: when running a container with no PID namespace and the parent process spawning the container is
+	// PID1 the pdeathsig is being delivered to the container's init process by the kernel for some reason
+	// even with the parent still running.
+	if p.config.Config.ParentDeathSignal > 0 {
+		cmd.SysProcAttr.Pdeathsig = syscall.Signal(p.config.Config.ParentDeathSignal)
+	}
+	return cmd, nil
+}
+
+func init() {
+	var config initConfig
+	nsPid := os.Getenv("_LIBCONTAINER_PIVOTROOTFS_PID")
+	if nsPid == "" {
+		return
+	}
+	if err := json.NewDecoder(os.Stdin).Decode(&config); err != nil {
+		fmt.Fprintf(os.Stderr, "jsondecode(stdin): %v", err)
+		os.Exit(1)
+	}
+	if err := pivotRootfs(&config); err != nil {
+		fmt.Fprintf(os.Stderr, "pivotRootfs(): %v", err)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func (p *initProcess) finalizeRootfsTemplate(childPipe io.Reader) (*exec.Cmd, error) {
+	cmd := exec.Command(p.container.initPath, p.container.initArgs[1:]...)
+	cmd.Args[0] = p.container.initArgs[0]
+	cmd.Stdin = childPipe
+	cmd.Dir = p.config.Config.Rootfs
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.Env = append(cmd.Env, fmt.Sprintf("_LIBCONTAINER_FINALIZEROOTFS_PID=%d", p.pid()))
+	// NOTE: when running a container with no PID namespace and the parent process spawning the container is
+	// PID1 the pdeathsig is being delivered to the container's init process by the kernel for some reason
+	// even with the parent still running.
+	if p.config.Config.ParentDeathSignal > 0 {
+		cmd.SysProcAttr.Pdeathsig = syscall.Signal(p.config.Config.ParentDeathSignal)
+	}
+	return cmd, nil
+}
+
+func init() {
+	var config initConfig
+	nsPid := os.Getenv("_LIBCONTAINER_FINALIZEROOTFS_PID")
+	if nsPid == "" {
+		return
+	}
+	if err := json.NewDecoder(os.Stdin).Decode(&config); err != nil {
+		fmt.Fprintf(os.Stderr, "jsondecode(stdin): %v", err)
+		os.Exit(1)
+	}
+	if err := finalizeRootfs(config.Config); err != nil {
+		fmt.Fprintf(os.Stderr, "finalizeRootfs(): %v", err)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
 func (p *initProcess) start() error {
 	defer p.parentPipe.Close()
 	err := p.cmd.Start()
@@ -315,9 +491,16 @@ func (p *initProcess) start() error {
 	if err := p.sendConfig(); err != nil {
 		return newSystemErrorWithCause(err, "sending config to init process")
 	}
+	encodedConfig, err := json.Marshal(p.config)
+	if err != nil {
+		return newSystemErrorWithCause(err, "encoding config of init process")
+	}
 	var (
-		sentRun    bool
-		sentResume bool
+		sentRun       bool
+		sentResume    bool
+		sentMounted   bool
+		sentPivoted   bool
+		sentFinalized bool
 	)
 
 	ierr := parseSync(p.parentPipe, func(sync *syncT) error {
@@ -391,6 +574,45 @@ func (p *initProcess) start() error {
 				return newSystemErrorWithCause(err, "writing syncT 'resume'")
 			}
 			sentResume = true
+		case procMountRootfs:
+			proc := procCantMountRootfs
+			description := "cantMountRootfs"
+			if cmd, err := p.mountRootfsTemplate(bytes.NewReader(encodedConfig)); err == nil {
+				if combined, err := cmd.CombinedOutput(); len(combined) == 0 && err == nil {
+					proc = procRootfsMounted
+					description = "rootfsMounted"
+				}
+			}
+			if err := writeSync(p.parentPipe, proc); err != nil {
+				return newSystemErrorWithCause(err, fmt.Sprintf("writing syncT '%s'", description))
+			}
+			sentMounted = true
+		case procPivotRootfs:
+			proc := procCantPivotRootfs
+			description := "cantPivotRootfs"
+			if cmd, err := p.pivotRootfsTemplate(bytes.NewReader(encodedConfig)); err == nil {
+				if combined, err := cmd.CombinedOutput(); len(combined) == 0 && err == nil {
+					proc = procRootfsPivoted
+					description = "rootfsPivoted"
+				}
+			}
+			if err := writeSync(p.parentPipe, proc); err != nil {
+				return newSystemErrorWithCause(err, fmt.Sprintf("writing syncT '%s'", description))
+			}
+			sentPivoted = true
+		case procFinalizeRootfs:
+			proc := procDidntFinalizeRootfs
+			description := "didntFinalizeRootfs"
+			if cmd, err := p.finalizeRootfsTemplate(bytes.NewReader(encodedConfig)); err == nil {
+				if combined, err := cmd.CombinedOutput(); len(combined) == 0 && err == nil {
+					proc = procRootfsFinalized
+					description = "rootfsFinalized"
+				}
+			}
+			if err := writeSync(p.parentPipe, proc); err != nil {
+				return newSystemErrorWithCause(err, fmt.Sprintf("writing syncT '%s'", description))
+			}
+			sentFinalized = true
 		default:
 			return newSystemError(fmt.Errorf("invalid JSON payload from child"))
 		}
@@ -400,6 +622,15 @@ func (p *initProcess) start() error {
 
 	if !sentRun {
 		return newSystemErrorWithCause(ierr, "container init")
+	}
+	if !sentMounted {
+		return newSystemErrorWithCause(ierr, "mount rootfs")
+	}
+	if !sentPivoted && !p.config.Config.NoPivotRoot && p.config.Config.Namespaces.Contains(configs.NEWNS) {
+		return newSystemErrorWithCause(ierr, "pivot rootfs")
+	}
+	if !sentFinalized {
+		return newSystemErrorWithCause(ierr, "finalize rootfs")
 	}
 	if p.config.Config.Namespaces.Contains(configs.NEWNS) && !sentResume {
 		return newSystemError(fmt.Errorf("could not synchronise after executing prestart hooks with container process"))

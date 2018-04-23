@@ -962,3 +962,100 @@ void nsexec(void)
 	/* Should never be reached. */
 	bail("should never be reached");
 }
+
+static void ns_join_namespaces_of_pid(const char *pid)
+{
+	const char *oom = "out of memory\n";
+	char *nspath, *error_message;
+	char *namespaces[] = {"mnt", "cgroup", "ipc", "net", "pid", "uts"};
+	int ns[sizeof(namespaces) / sizeof(namespaces[0])];
+	int syncpipe[2];
+	pid_t child_pid;
+
+	if (pid == NULL || *pid == '\0')
+		return;
+
+	/* For debugging. */
+	prctl(PR_SET_NAME, (unsigned long)"runc:[3:MOUNTPARENT]", 0, 0, 0);
+
+	/* For synchronization among this parent/child pair. */
+	if (pipe(syncpipe) == -1) {
+		char *error;
+		if (asprintf(&error, "pipe: %m") == -1) {
+			write(STDERR_FILENO, oom, strlen(oom));
+			_exit(1);
+		}
+		write(STDERR_FILENO, error, strlen(error));
+		_exit(1);
+	}
+
+	/* Open descriptors for the namespaces that we'll be joining. */
+	for (unsigned i = 0; i < sizeof(namespaces)/sizeof(namespaces[0]); i++) {
+		if (asprintf(&nspath, "/proc/%s/ns/%s", pid, namespaces[i]) == -1) {
+			write(STDERR_FILENO, oom, strlen(oom));
+			_exit(1);
+		}
+		ns[i] = open(nspath, O_RDONLY);
+		if (ns[i] == -1) {
+			if (asprintf(&error_message, "open('%s'): %m", nspath) == -1) {
+				write(STDERR_FILENO, oom, strlen(oom));
+				_exit(1);
+			}
+			write(STDERR_FILENO, error_message, strlen(error_message));
+			_exit(1);
+		}
+	}
+
+	/* Join the namespaces. */
+	for (unsigned i = 0; i < sizeof(namespaces)/sizeof(namespaces[0]); i++) {
+		if (setns(ns[i], nsflag(namespaces[i])) == -1) {
+			if (asprintf(&error_message, "setns(%d, %s): %m", ns[i], namespaces[i]) == -1) {
+				write(STDERR_FILENO, oom, strlen(oom));
+				_exit(1);
+			}
+			write(STDERR_FILENO, error_message, strlen(error_message));
+			_exit(1);
+		}
+	}
+
+	child_pid = fork();
+	if (child_pid == -1) {
+		/* error */
+		char *error;
+		if (asprintf(&error, "fork: %m") == -1) {
+			write(STDERR_FILENO, oom, strlen(oom));
+			_exit(1);
+		}
+		write(STDERR_FILENO, error, strlen(error));
+		_exit(1);
+	}
+	if (child_pid != 0) {
+		/* We're the parent, which waits for the child. */
+		int wstatus;
+		unsigned char b;
+		close(syncpipe[1]);
+		read(syncpipe[0], &b, 1);
+		waitpid(child_pid, &wstatus, 0);
+		_exit(wstatus);
+	}
+	/* We're the child, which is now properly in the PID namespace. */
+	close(syncpipe[0]);
+	/* For debugging. */
+	prctl(PR_SET_NAME, (unsigned long)"runc:[4:MOUNTCHILD]", 0, 0, 0);
+	/* continues */
+}
+
+void ns_init_mount_rootfs(void)
+{
+	ns_join_namespaces_of_pid(getenv("_LIBCONTAINER_MOUNTROOTFS_PID"));
+}
+
+void ns_init_pivot_rootfs(void)
+{
+	ns_join_namespaces_of_pid(getenv("_LIBCONTAINER_PIVOTROOTFS_PID"));
+}
+
+void ns_init_finalize_rootfs(void)
+{
+	ns_join_namespaces_of_pid(getenv("_LIBCONTAINER_FINALIZEROOTFS_PID"));
+}

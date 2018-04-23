@@ -241,6 +241,99 @@ func syncParentHooks(pipe io.ReadWriter) error {
 	return nil
 }
 
+// syncParentMountRootfs sends to the given pipe a JSON payload which indicates
+// that the parent should mount the root filesystem and other filesystems. It
+// then waits for the parent to indicate that it is finished doing so.
+func syncParentMountRootfs(pipe io.ReadWriter) (bool, error) {
+	// Tell parent.
+	if err := writeSync(pipe, procMountRootfs); err != nil {
+		return false, err
+	}
+
+	// Wait for parent to give the all-clear.
+	parentDidIt := false
+	breakingError := fmt.Errorf("not really an error, but used to break out of parseSync when preparing rootfs")
+	err := parseSync(pipe, func(t *syncT) error {
+		switch t.Type {
+		case procRootfsMounted:
+			parentDidIt = true
+			return breakingError
+		case procCantMountRootfs:
+			parentDidIt = false
+			return breakingError
+		default:
+			return newSystemError(fmt.Errorf("invalid JSON payload from parent"))
+		}
+	})
+	if err == breakingError {
+		err = nil
+	}
+	return parentDidIt, err
+}
+
+// syncParentPivotRootfs sends to the given pipe a JSON payload which indicates
+// that the parent should pivot the root filesystem inside of the child's mount
+// namespace. It then waits for the parent to indicate that it is finished
+// doing so.
+func syncParentPivotRootfs(pipe io.ReadWriter) (bool, error) {
+	// Tell parent.
+	if err := writeSync(pipe, procPivotRootfs); err != nil {
+		return false, err
+	}
+
+	// Wait for parent to give the all-clear.
+	parentDidIt := false
+	breakingError := fmt.Errorf("not really an error, but used to break out of parseSync when preparing rootfs")
+	err := parseSync(pipe, func(t *syncT) error {
+		switch t.Type {
+		case procRootfsPivoted:
+			parentDidIt = true
+			return breakingError
+		case procCantPivotRootfs:
+			parentDidIt = false
+			return breakingError
+		default:
+			return newSystemError(fmt.Errorf("invalid JSON payload from parent"))
+		}
+	})
+	if err == breakingError {
+		err = nil
+	}
+	return parentDidIt, err
+}
+
+// syncParentFinalizeRootfs sends to the given pipe a JSON payload which
+// indicates that the parent should finish preparations on the root filesystem,
+// usually just marking things that need to be read-only as read-only.
+// It then waits for the parent to indicate that it is finished doing so.
+func syncParentFinalizeRootfs(pipe io.ReadWriter) (bool, error) {
+	// Tell parent.
+	if err := writeSync(pipe, procFinalizeRootfs); err != nil {
+		return false, err
+	}
+
+	// Wait for parent to give the all-clear.
+	parentDidIt := false
+	breakingError := fmt.Errorf("not really an error, but used to break out of parseSync when finalizing rootfs")
+	err := parseSync(pipe, func(t *syncT) error {
+		switch t.Type {
+		case procRootfsFinalized:
+			parentDidIt = true
+			return breakingError
+		case procDidntFinalizeRootfs:
+			parentDidIt = false
+			return breakingError
+		default:
+			return newSystemError(fmt.Errorf("invalid JSON payload from parent"))
+		}
+		return nil
+	})
+	if err == breakingError {
+		err = nil
+	}
+	return parentDidIt, err
+}
+
 // setupUser changes the groups, gid, and uid for the user inside the container
 func setupUser(config *initConfig) error {
 	// Set up defaults.

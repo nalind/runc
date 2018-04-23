@@ -27,6 +27,9 @@ import (
 
 const defaultMountFlags = unix.MS_NOEXEC | unix.MS_NOSUID | unix.MS_NODEV
 
+// types of filesystems which the parent attempts to mount on behalf of the container.
+var parentMountTypes = []string{"bind", "cgroup", "devpts", "mqueue", "proc", "tmpfs", "sysfs"}
+
 // needsSetupDev returns true if /dev needs to be set up.
 func needsSetupDev(config *configs.Config) bool {
 	for _, m := range config.Mounts {
@@ -37,16 +40,50 @@ func needsSetupDev(config *configs.Config) bool {
 	return true
 }
 
-// prepareRootfs sets up the devices, mount points, and filesystems for use
-// inside a new mount namespace. It doesn't set anything as ro. You must call
-// finalizeRootfs after this function to finish setting up the rootfs.
-func prepareRootfs(pipe io.ReadWriter, iConfig *initConfig) (err error) {
+func skipDevice(candidate string, onlyDevices, exceptDevices []string) bool {
+	skip := false
+	if len(onlyDevices) > 0 {
+		skip = true
+		for _, device := range onlyDevices {
+			if candidate == device {
+				skip = false
+				break
+			}
+		}
+	}
+	for _, device := range exceptDevices {
+		if candidate == device {
+			skip = true
+			break
+		}
+	}
+	return skip
+}
+
+// pivotRootfs sets propagation flags and mounts the filesystems for the new
+// mount namespace.  It is called only by prepareRootfs, possibly in the parent
+// process.
+func pivotRootfs(iConfig *initConfig) (err error) {
+	if err := unix.Chdir(iConfig.Config.Rootfs); err != nil {
+		return newSystemErrorWithCausef(err, "changing dir to %q", iConfig.Config.Rootfs)
+	}
+	return pivotRoot(iConfig.Config.Rootfs)
+}
+
+// mountRootfs sets propagation flags and mounts the filesystems for the new
+// mount namespace.  It is called only by prepareRootfs, possibly in the parent
+// process.
+func mountRootfs(iConfig *initConfig, onlyDevices, exceptDevices []string, devicesToo bool) (err error) {
 	config := iConfig.Config
-	if err := prepareRoot(config); err != nil {
+	if err := prepareRoot(config, onlyDevices, exceptDevices); err != nil {
 		return newSystemErrorWithCause(err, "preparing rootfs")
 	}
 
 	for _, m := range config.Mounts {
+		if skipDevice(m.Device, onlyDevices, exceptDevices) {
+			continue
+		}
+
 		for _, precmd := range m.PremountCmds {
 			if err := mountCmd(precmd); err != nil {
 				return newSystemErrorWithCause(err, "running premount command")
@@ -64,7 +101,7 @@ func prepareRootfs(pipe io.ReadWriter, iConfig *initConfig) (err error) {
 		}
 	}
 
-	setupDev := needsSetupDev(config)
+	setupDev := needsSetupDev(config) && devicesToo
 
 	if setupDev {
 		if err := createDevices(config); err != nil {
@@ -77,6 +114,47 @@ func prepareRootfs(pipe io.ReadWriter, iConfig *initConfig) (err error) {
 			return newSystemErrorWithCause(err, "setting up /dev symlinks")
 		}
 	}
+
+	return nil
+}
+
+// prepareRootfs sets up the devices, mount points, and filesystems for use
+// inside a new mount namespace. It doesn't set anything as ro. You must call
+// finalizeRootfs after this function to finish setting up the rootfs.
+func prepareRootfs(pipe io.ReadWriter, iConfig *initConfig) (err error) {
+	// Ask the parent to mount everything into our namespace
+	parentMounted, err := syncParentMountRootfs(pipe)
+	if err != nil {
+		return err
+	}
+	if len(parentMountTypes) == 0 {
+		// Parent tried to mount everything.
+		if !parentMounted {
+			// Mount everything ourselves, because the parent
+			// couldn't or wouldn't do it for us.
+			if err := mountRootfs(iConfig, nil, nil, true); err != nil {
+				return err
+			}
+		}
+	} else {
+		// The parent tried to mount only specific types of
+		// filesystems, so we need to handle the rest.
+		exceptMountTypes := parentMountTypes
+		devicesToo := false
+		if !parentMounted {
+			// The parent failed to mount even the subset of
+			// filesystems that it tried to, so we have to mount
+			// everything.
+			exceptMountTypes = nil
+			devicesToo = true
+		}
+		// Mount whatever the parent didn't or couldn't.
+		if err := mountRootfs(iConfig, nil, exceptMountTypes, devicesToo); err != nil {
+			return err
+		}
+	}
+
+	config := iConfig.Config
 
 	// Signal the parent to run the pre-start hooks.
 	// The hooks are run after the mounts are setup, but before we switch to the new
@@ -95,20 +173,31 @@ func prepareRootfs(pipe io.ReadWriter, iConfig *initConfig) (err error) {
 	// container. It's just cleaner to do this here (at the expense of the
 	// operation not being perfectly split).
 
-	if err := unix.Chdir(config.Rootfs); err != nil {
-		return newSystemErrorWithCausef(err, "changing dir to %q", config.Rootfs)
-	}
-
 	if config.NoPivotRoot {
+		if err := unix.Chdir(config.Rootfs); err != nil {
+			return newSystemErrorWithCausef(err, "changing dir to %q", config.Rootfs)
+		}
 		err = msMoveRoot(config.Rootfs)
 	} else if config.Namespaces.Contains(configs.NEWNS) {
-		err = pivotRoot(config.Rootfs)
+		// Ask the parent to pivot our root for us
+		parentPivoted, err := syncParentPivotRootfs(pipe)
+		if err != nil {
+			return err
+		}
+		if !parentPivoted {
+			pivotRootfs(iConfig)
+		}
 	} else {
+		if err := unix.Chdir(config.Rootfs); err != nil {
+			return newSystemErrorWithCausef(err, "changing dir to %q", config.Rootfs)
+		}
 		err = chroot(config.Rootfs)
 	}
 	if err != nil {
 		return newSystemErrorWithCause(err, "jailing process inside rootfs")
 	}
+
+	setupDev := needsSetupDev(config)
 
 	if setupDev {
 		if err := reOpenDevNull(); err != nil {
@@ -149,7 +238,6 @@ func finalizeRootfs(config *configs.Config) (err error) {
 		}
 	}
 
-	unix.Umask(0022)
 	return nil
 }
 
@@ -608,20 +696,24 @@ func rootfsParentMountPrivate(rootfs string) error {
 	return nil
 }
 
-func prepareRoot(config *configs.Config) error {
+func prepareRoot(config *configs.Config, onlyDevices, exceptDevices []string) error {
 	flag := unix.MS_SLAVE | unix.MS_REC
 	if config.RootPropagation != 0 {
 		flag = config.RootPropagation
 	}
 	if err := unix.Mount("", "/", "", uintptr(flag), ""); err != nil {
-		return err
+		return newSystemErrorWithCausef(err, "setting root propagation")
+	}
+
+	if skipDevice("bind", onlyDevices, exceptDevices) {
+		return nil
 	}
 
 	// Make parent mount private to make sure following bind mount does
 	// not propagate in other namespaces. Also it will help with kernel
 	// check pass in pivot_root. (IS_SHARED(new_mnt->mnt_parent))
 	if err := rootfsParentMountPrivate(config.Rootfs); err != nil {
-		return err
+		return newSystemErrorWithCausef(err, "mounting the root filesystem MS_PRIVATE")
 	}
 
 	return unix.Mount(config.Rootfs, config.Rootfs, "bind", unix.MS_BIND|unix.MS_REC, "")

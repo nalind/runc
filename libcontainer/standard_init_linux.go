@@ -82,10 +82,19 @@ func (l *linuxStandardInit) Init() error {
 
 	// Finish the rootfs setup.
 	if l.config.Config.Namespaces.Contains(configs.NEWNS) {
-		if err := finalizeRootfs(l.config.Config); err != nil {
+		// Tell our parent that we're ready for it to finish setting up filesystems.
+		parentFinalized, err := syncParentFinalizeRootfs(l.pipe)
+		if err != nil {
 			return err
 		}
+		if !parentFinalized {
+			// The parent didn't or couldn't do it, so try to do it ourselves
+			if err := finalizeRootfs(l.config.Config); err != nil {
+				return err
+			}
+		}
 	}
+	unix.Umask(0022)
 
 	if hostname := l.config.Config.Hostname; hostname != "" {
 		if err := unix.Sethostname([]byte(hostname)); err != nil {

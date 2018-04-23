@@ -16,22 +16,35 @@ type syncType string
 //
 // [  child  ] <-> [   parent   ]
 //
+// procMountRootfs --> [mount things]
+//                 <-- procRootfsMounted or procCantMountRootfs
+//
 // procHooks   --> [run hooks]
 //             <-- procResume
 //
-// procConsole -->
-//             <-- procConsoleReq
-//  [send(fd)] --> [recv(fd)]
-//             <-- procConsoleAck
+// procPivotRootfs --> [pivot rootfs] (optional)
+//                 <-- procRootfsPivoted or procCantPivotRootfs
+//
+// procFinalizeRootfs --> [finalize rootfs]
+//                    <-- procRootfsFinalizeed or procDidntFinalizeRootfs
 //
 // procReady   --> [final setup]
 //             <-- procRun
 const (
-	procError  syncType = "procError"
-	procReady  syncType = "procReady"
-	procRun    syncType = "procRun"
-	procHooks  syncType = "procHooks"
-	procResume syncType = "procResume"
+	procError               syncType = "procError"
+	procReady               syncType = "procReady"
+	procRun                 syncType = "procRun"
+	procHooks               syncType = "procHooks"
+	procResume              syncType = "procResume"
+	procMountRootfs         syncType = "procMountRootfs"
+	procRootfsMounted       syncType = "procRootfsMounted"
+	procCantMountRootfs     syncType = "procCantMountRootfs"
+	procPivotRootfs         syncType = "procPivotRootfs"
+	procRootfsPivoted       syncType = "procRootfsPivoted"
+	procCantPivotRootfs     syncType = "procCantPivotRootfs"
+	procFinalizeRootfs      syncType = "procFinalizeRootfs"
+	procRootfsFinalized     syncType = "procRootfsFinalized"
+	procDidntFinalizeRootfs syncType = "procDidntFinalizeRootfs"
 )
 
 type syncT struct {
